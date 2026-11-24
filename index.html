@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>IPHIPI · Brand portal demo</title>
+<style>
+:root{--navy:#0A2540;--teal:#0B7A70;--bg:#F6F9FB;--ink:#0A2540;--mute:#4a5f73;--line:#d5dee6;--err:#b3261e}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{width:min(92vw,400px);background:#fff;border:1px solid var(--line);border-radius:12px;padding:32px 28px;box-shadow:0 6px 24px rgba(10,37,64,.08)}
+.brand{font-weight:800;letter-spacing:.14em;color:var(--navy);font-size:20px}
+.brand span{color:var(--teal)}
+h1{font-size:18px;margin:6px 0 4px;font-weight:600}
+p{margin:0 0 18px;color:var(--mute);font-size:14px;line-height:1.45}
+label{display:block;font-size:13px;font-weight:600;margin:14px 0 5px}
+input{width:100%;padding:10px 12px;font:inherit;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+input:focus{outline:2px solid var(--teal);outline-offset:1px}
+button{margin-top:20px;width:100%;padding:11px;font:inherit;font-weight:600;color:#fff;background:var(--teal);border:0;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+#err{min-height:20px;margin-top:12px;color:var(--err);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<div class="brand">IPHIPI<span>.</span></div>
+<h1>Brand portal demo</h1>
+<p>This demo is encrypted; your browser decrypts it after you sign in.</p>
+<form id="f" autocomplete="on">
+<label for="email">Email</label>
+<input id="email" name="email" type="email" autocomplete="username" required>
+<label for="pw">Password</label>
+<input id="pw" name="password" type="password" autocomplete="current-password" required>
+<div id="err" role="alert" aria-live="polite"></div>
+<button id="go" type="submit">Sign in</button>
+</form>
+</main>
+<script>
+(function () {
+  "use strict";
+  var BASE = "/iphipi-portal-demo/";
+  var enc = new TextEncoder();
+  var $ = function (id) { return document.getElementById(id); };
+  function b64(s) { var b = atob(s), o = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) o[i] = b.charCodeAt(i); return o; }
+  function say(m) { $("err").textContent = m || ""; }
+  function idbPut(rec) {
+    return new Promise(function (res, rej) {
+      var r = indexedDB.open("iphipi-demo", 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore("kv"); };
+      r.onerror = function () { rej(r.error); };
+      r.onsuccess = function () {
+        var t = r.result.transaction("kv", "readwrite"); t.objectStore("kv").put(rec, "k");
+        t.oncomplete = function () { res(); }; t.onerror = function () { rej(t.error); };
+      };
+    });
+  }
+  async function derive(pw, salt, email) {
+    var s = new Uint8Array(salt.length + email.length); s.set(salt); s.set(email, salt.length);
+    var base = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt: s, iterations: 600000 }, base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  }
+  async function unlock(email, pw) {
+    var logins = await (await fetch(BASE + "_demo/logins.json", { cache: "no-cache" })).json();
+    var em = enc.encode(email.trim().toLowerCase());
+    for (var i = 0; i < logins.length; i++) {
+      try {
+        var kek = await derive(pw, b64(logins[i].salt), em);
+        var raw = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(logins[i].iv) }, kek, b64(logins[i].wrapped));
+        var key = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+        var chk = new Uint8Array(await (await fetch(BASE + "_demo/check.bin", { cache: "no-cache" })).arrayBuffer());
+        var ok = await crypto.subtle.decrypt({ name: "AES-GCM", iv: chk.slice(0, 12) }, key, chk.slice(12));
+        if (new TextDecoder().decode(ok) === "ok") return key;
+      } catch (e) { /* wrong entry: try the next one */ }
+    }
+    return null;
+  }
+  function target() {
+    var p = location.pathname;
+    if (p.indexOf(BASE) !== 0) return BASE;
+    var rel = p.slice(BASE.length);
+    if (!rel || rel === "index.html" || rel === "404.html" || rel === "logout" || rel.indexOf("cdn-cgi/") === 0) return BASE;
+    return p + location.search;
+  }
+  $("f").addEventListener("submit", async function (ev) {
+    ev.preventDefault(); say("");
+    if (!window.crypto || !crypto.subtle || !("serviceWorker" in navigator)) { say("This browser cannot open the demo (needs a secure page, WebCrypto and service workers)."); return; }
+    var btn = $("go"); btn.disabled = true; btn.textContent = "Signing in...";
+    try {
+      var key = await unlock($("email").value, $("pw").value);
+      if (!key) { say("Email or password is not right."); return; }
+      await idbPut({ key: key, exp: Date.now() + 12 * 3600 * 1000 });
+      var reg = await navigator.serviceWorker.register(BASE + "sw.js", { scope: BASE });
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await new Promise(function (res) {
+          navigator.serviceWorker.addEventListener("controllerchange", function () { res(); });
+          setTimeout(res, 4000);
+        });
+      }
+      location.replace(target());
+    } catch (e) {
+      say("Could not sign in on this browser (" + (e && e.name ? e.name : "error") + ").");
+    } finally { btn.disabled = false; btn.textContent = "Sign in"; }
+  });
+})();
+</script>
+</body>
+</html>
